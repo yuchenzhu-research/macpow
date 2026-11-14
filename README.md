@@ -297,10 +297,19 @@ This helps add support for new Apple Silicon variants.
 
 On macOS 27, some machines stop updating the IOReport CPU energy counters
 ([#20](https://github.com/k06a/macpow/issues/20)). On systems with the
-`AppleT6050CLPC` driver, macpow can read aggregate CPU power from AppleCLPC
-without `sudo`. This counter has no breakdown by cluster or core. The TUI shows
-`N/A` for those power readings. In JSON, `soc.cpu_breakdown_unavailable` is
-`true` and the corresponding wattage fields remain numeric zeros for compatibility.
+`AppleT6050CLPC` driver, macpow reads aggregate CPU power from AppleCLPC without
+`sudo`. For per-core and cluster power, macpow uses Apple's Energy Model when
+those counters update. On an affected Mac, start Apple's sampler in a separate
+terminal tab and run macpow as your regular user:
+
+```sh
+sudo /usr/bin/powermetrics --samplers cpu_power -i 250 -o /dev/null
+```
+
+Press Ctrl+C in that tab to stop the sampler. When the Energy Model stops
+updating, the TUI shows `N/A` for the cluster and core power. In JSON,
+`soc.cpu_breakdown_unavailable` is `true` and the corresponding wattage fields
+contain numeric zeros for compatibility.
 Run `macpow --check-cpu-cores` during a CPU workload to check each named core
 counter directly. The diagnostic averages power between observed updates and
 skips the first increase, which can contain energy from before the test.
