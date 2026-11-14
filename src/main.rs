@@ -32,7 +32,7 @@ struct CliArgs {
     #[arg(long)]
     dump: bool,
 
-    /// Check whether each CPU core's energy counter updates over two seconds
+    /// Check whether each CPU core's energy counter updates over three seconds
     #[arg(long, conflicts_with_all = ["dump", "dump_smc", "json"])]
     check_cpu_cores: bool,
 

@@ -654,36 +654,59 @@ impl IOReportSampler {
     /// Check the named Energy Model counters directly, independently of the
     /// source selected for the aggregate CPU power row.
     pub fn check_cpu_core_counters(&self) -> Result<()> {
-        let prev = self.sample()?;
-        std::thread::sleep(Duration::from_secs(2));
-        let cur = self.sample()?;
-        let dt = cur.ts.duration_since(prev.ts);
-        let before = prev.cpu_core_energy();
-        let after = cur.cpu_core_energy();
-        if before.is_empty() {
+        let first = self.sample()?;
+        let mut checks: BTreeMap<_, _> = first
+            .cpu_core_energy()
+            .into_iter()
+            .map(|(name, (unit, value))| {
+                (
+                    name,
+                    (
+                        unit,
+                        CoreCounterCheck {
+                            latest: value,
+                            ..Default::default()
+                        },
+                    ),
+                )
+            })
+            .collect();
+        if checks.is_empty() {
             bail!("No per-core CPU Energy Model channels found");
+        }
+        while first.ts.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(100));
+            let sample = self.sample()?;
+            let readings = sample.cpu_core_energy();
+            for (name, (unit, check)) in &mut checks {
+                let reading = readings
+                    .get(name)
+                    .filter(|(u, _)| u == unit)
+                    .map(|(_, v)| *v);
+                check.observe(reading, sample.ts);
+            }
         }
 
         println!(
             "Per-core Energy Model counters over {:.3} s:",
-            dt.as_secs_f64()
+            first.ts.elapsed().as_secs_f64()
         );
         let mut advancing = 0;
-        for (name, (unit, start)) in &before {
-            match after.get(name) {
-                Some((end_unit, end)) if unit == end_unit && end > start => {
-                    let delta = end - start;
-                    let watts = energy_to_watts(delta, unit, dt.as_millis() as u64);
-                    println!("{name:<16} {watts:>8.3} W    +{delta} {unit}");
-                    advancing += 1;
-                }
-                Some((end_unit, end)) if unit == end_unit && end == start => {
-                    println!("{name:<16}      N/A      counter unchanged");
-                }
-                _ => println!("{name:<16}      N/A      counter reset or missing"),
+        for (name, (unit, check)) in &checks {
+            if check.invalid {
+                println!("{name:<16}      N/A      counter reset or missing");
+            } else if let Some((energy, dt_ms)) = check.measured_delta() {
+                let watts = energy_to_watts(energy, unit, dt_ms);
+                println!("{name:<16} {watts:>8.3} W    +{energy} {unit} over {dt_ms} ms");
+                advancing += 1;
+            } else if check.first_advance.is_some() {
+                println!("{name:<16}      N/A      one update; no confirmed refresh interval");
+                advancing += 1;
+            } else {
+                println!("{name:<16}      N/A      counter unchanged");
             }
         }
-        println!("{advancing}/{} core counters advanced.", before.len());
+        println!("{advancing}/{} core counters advanced.", checks.len());
         Ok(())
     }
 
@@ -1142,6 +1165,38 @@ pub struct Sample {
     ts: Instant,
 }
 
+#[derive(Default)]
+struct CoreCounterCheck {
+    latest: i64,
+    first_advance: Option<(i64, Instant)>,
+    last_advance: Option<Instant>,
+    invalid: bool,
+}
+
+impl CoreCounterCheck {
+    fn observe(&mut self, value: Option<i64>, time: Instant) {
+        let Some(value) = value.filter(|&v| v >= self.latest) else {
+            self.invalid = true;
+            return;
+        };
+        if value > self.latest {
+            if self.first_advance.is_none() {
+                // The first jump can cover time before we started sampling.
+                self.first_advance = Some((value, time));
+            } else {
+                self.last_advance = Some(time);
+            }
+            self.latest = value;
+        }
+    }
+
+    fn measured_delta(&self) -> Option<(i64, u64)> {
+        let (start, time) = self.first_advance?;
+        let ms = self.last_advance?.duration_since(time).as_millis() as u64;
+        (!self.invalid && ms > 0).then_some((self.latest - start, ms))
+    }
+}
+
 impl Sample {
     fn cpu_core_energy(&self) -> BTreeMap<String, (String, i64)> {
         unsafe {
@@ -1179,6 +1234,22 @@ impl Drop for Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_core_diagnostic_excludes_the_initial_counter_jump() {
+        let start = Instant::now();
+        let mut check = CoreCounterCheck {
+            latest: 1_000,
+            ..Default::default()
+        };
+        check.observe(Some(90_000), start);
+        assert_eq!(check.measured_delta(), None);
+        check.observe(Some(90_000), start + Duration::from_millis(100));
+        check.observe(Some(90_600), start + Duration::from_millis(500));
+        assert_eq!(check.measured_delta(), Some((600, 500)));
+        check.observe(Some(0), start + Duration::from_secs(1));
+        assert_eq!(check.measured_delta(), None);
+    }
 
     #[test]
     fn parses_modern_cpu_stats_names() {

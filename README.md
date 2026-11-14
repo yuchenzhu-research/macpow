@@ -95,7 +95,7 @@ macpow                    # TUI mode (default)
 macpow --json             # JSON output to stdout
 macpow --interval 500     # Set sampling interval in ms (default: 250)
 macpow --dump             # Dump IOReport channel names (diagnostics)
-macpow --check-cpu-cores  # Check each CPU core's energy counter over two seconds
+macpow --check-cpu-cores  # Check each CPU core's energy counter over three seconds
 macpow --dump-smc         # Dump every SMC key with type and value (diagnostics)
 ```
 
@@ -302,8 +302,10 @@ without `sudo`. This counter has no breakdown by cluster or core. The TUI shows
 `N/A` for those power readings. In JSON, `soc.cpu_breakdown_unavailable` is
 `true` and the corresponding wattage fields remain numeric zeros for compatibility.
 Run `macpow --check-cpu-cores` during a CPU workload to check each named core
-counter directly. The diagnostic displays `N/A` for a counter that did not
-advance during the test window. An idle core can also have an unchanged counter.
+counter directly. The diagnostic averages power between observed updates and
+skips the first increase, which can contain energy from before the test.
+Counters with fewer than two updates show `N/A`. An idle core can also have
+an unchanged counter.
 
 ## License
 
