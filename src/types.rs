@@ -54,6 +54,9 @@ pub struct CpuCore {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SocPower {
     pub cpu_w: f32,
+    /// True when the aggregate-only CLPC counter supplies CPU power. In this
+    /// case the cluster and core wattage fields are unavailable (zero).
+    pub cpu_breakdown_unavailable: bool,
     pub ecpu_clusters: Vec<CpuCluster>,
     pub pcpu_cluster: CpuCluster,
     pub gpu_w: f32,

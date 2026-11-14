@@ -1,11 +1,20 @@
 use crate::cf_utils;
+use crate::iokit_ffi::{
+    IOObjectRelease, IORegistryEntryCreateCFProperties, IORegistryEntryGetRegistryEntryID,
+    IOServiceGetMatchingService, IOServiceMatching,
+};
 use crate::types::SocPower;
 use anyhow::{bail, Result};
+use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;
+use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
+use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::array::CFArrayRef;
+use core_foundation_sys::array::{CFArrayAppendValue, CFArrayCreateMutableCopy, CFArrayRef};
 use core_foundation_sys::base::CFTypeRef;
-use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
+use core_foundation_sys::dictionary::{
+    CFDictionaryRef, CFDictionarySetValue, CFMutableDictionaryRef,
+};
 use core_foundation_sys::string::CFStringRef;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::{PhantomData, PhantomPinned};
@@ -87,6 +96,97 @@ fn energy_to_watts(val: i64, unit: &str, dt_ms: u64) -> f32 {
         "nJ" => per_sec / 1e9,
         _ => 0.0,
     }
+}
+
+const CLPC_CPU_GROUP: &str = "CLPC";
+const CLPC_CPU_CHANNEL: &str = "CPU Energy";
+
+/// macOS 27 can stop updating the named CPU counter. Request the aggregate
+/// report directly from the M5 Pro/Max CLPC driver when its mapping is known.
+/// Report ID: https://github.com/vladkens/macmon/blob/7df49f5/src/clpc.rs
+/// Channel format: https://github.com/vladkens/macmon/blob/7df49f5/src/sources.rs
+unsafe fn channels_with_clpc_cpu(channels: CFDictionaryRef) -> Option<CFMutableDictionaryRef> {
+    let mut version = [0u8; 32];
+    let mut len = version.len();
+    if libc::sysctlbyname(
+        c"kern.osproductversion".as_ptr(),
+        version.as_mut_ptr().cast(),
+        &mut len,
+        ptr::null_mut(),
+        0,
+    ) != 0
+        || !version.starts_with(b"27.")
+    {
+        return None;
+    }
+
+    // Match the firmware driver, since the opaque report ID varies by driver.
+    let service = IOServiceGetMatchingService(0, IOServiceMatching(c"AppleCLPC".as_ptr()));
+    if service == 0 {
+        return None;
+    }
+    let mut properties = ptr::null_mut();
+    let mut driver_id = 0;
+    let found = IORegistryEntryGetRegistryEntryID(service, &mut driver_id) == 0
+        && IORegistryEntryCreateCFProperties(service, &mut properties, ptr::null(), 0) == 0;
+    IOObjectRelease(service);
+    let bundle = (found && !properties.is_null())
+        .then(|| cf_utils::cfdict_get_string(properties, "CFBundleIdentifier"))
+        .flatten();
+    cf_utils::cf_release(properties as _);
+    if bundle.as_deref() != Some("com.apple.driver.AppleT6050CLPC") {
+        return None;
+    }
+
+    let key = CFString::new("IOReportChannels");
+    let current = cf_utils::cfdict_get(channels, "IOReportChannels") as CFArrayRef;
+    if current.is_null() {
+        return None;
+    }
+    let selected = CFArrayCreateMutableCopy(ptr::null(), 0, current);
+    if selected.is_null() {
+        return None;
+    }
+    let with_clpc = cf_utils::cfdict_mutable_copy(channels);
+    if with_clpc.is_null() {
+        cf_utils::cf_release(selected as _);
+        return None;
+    }
+
+    // A single integer in the power category, with a nanojoule unit label.
+    let legend = CFArray::from_CFTypes(&[
+        CFNumber::from(0x0000_0010_d3ab_60bb_i64).into_CFType(),
+        CFNumber::from(1i64 | (2 << 16) | (1 << 32)).into_CFType(),
+        CFString::new(CLPC_CPU_CHANNEL).into_CFType(),
+    ]);
+    let info = CFDictionary::from_CFType_pairs(&[(
+        CFString::new("IOReportChannelUnit"),
+        CFNumber::from((3i64 << 56) | (118i64 << 32)),
+    )]);
+    let channel = CFMutableDictionary::from_CFType_pairs(&[
+        (
+            CFString::new("DriverID"),
+            CFNumber::from(driver_id as i64).into_CFType(),
+        ),
+        (
+            CFString::new("DriverName"),
+            CFString::new("AppleCLPC").into_CFType(),
+        ),
+        (
+            CFString::new("IOReportGroupName"),
+            CFString::new(CLPC_CPU_GROUP).into_CFType(),
+        ),
+        (
+            CFString::new("IOReportSubGroupName"),
+            CFString::new("Energy Counters").into_CFType(),
+        ),
+        (CFString::new("IOReportChannelInfo"), info.into_CFType()),
+        (CFString::new("LegendChannel"), legend.into_CFType()),
+    ]);
+    CFArrayAppendValue(selected, channel.as_CFTypeRef());
+    CFDictionarySetValue(with_clpc, key.as_CFTypeRef(), selected as _);
+    cf_utils::cf_release(selected as _);
+    Some(with_clpc)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -500,15 +600,29 @@ impl IOReportSampler {
                 bail!("IOReport: failed to create mutable channels copy");
             }
 
-            let mut subd: CFMutableDictionaryRef = ptr::null_mut();
-            let sub = IOReportCreateSubscription(ptr::null(), desired, &mut subd, 0, ptr::null());
+            let subscribe = |channels| {
+                let mut subd = ptr::null_mut();
+                let sub =
+                    IOReportCreateSubscription(ptr::null(), channels, &mut subd, 0, ptr::null());
+                if sub.is_null() || subd.is_null() {
+                    cf_utils::cf_release(sub as _);
+                    cf_utils::cf_release(subd as _);
+                    None
+                } else {
+                    Some((sub, subd))
+                }
+            };
+            let subscription = channels_with_clpc_cpu(desired)
+                .and_then(|channels| {
+                    let subscription = subscribe(channels);
+                    cf_utils::cf_release(channels as _);
+                    subscription
+                })
+                .or_else(|| subscribe(desired));
             cf_utils::cf_release(desired as _);
-
-            if sub.is_null() || subd.is_null() {
-                cf_utils::cf_release(sub as _);
-                cf_utils::cf_release(subd as _);
+            let Some((sub, subd)) = subscription else {
                 bail!("IOReport: subscription failed");
-            }
+            };
 
             // Read DVFS frequency tables from pmgr
             let (ecpu_freqs, pcpu_freqs, gpu_freqs) = read_dvfs_freq_tables();
@@ -589,6 +703,7 @@ impl IOReportSampler {
             }
 
             let mut soc = SocPower::default();
+            let mut clpc_cpu_w = None;
 
             let mut ecpu_order: Vec<CpuCoreKey> = Vec::new();
             let mut pcpu_order: Vec<CpuCoreKey> = Vec::new();
@@ -693,6 +808,13 @@ impl IOReportSampler {
                     continue;
                 }
 
+                if group == CLPC_CPU_GROUP && name == CLPC_CPU_CHANNEL {
+                    let val = IOReportSimpleGetIntegerValue(ch, 0);
+                    if val >= 0 {
+                        clpc_cpu_w = Some(energy_to_watts(val, "nJ", dt_ms));
+                    }
+                    continue;
+                }
                 if group != "Energy Model" {
                     continue;
                 }
@@ -879,6 +1001,22 @@ impl IOReportSampler {
                     (gpu_active_res as f64 / total_gpu_res as f64 * 100.0).round() as u32;
             }
 
+            // On affected systems the old counters can stall or update in
+            // bursts. CLPC measures the aggregate and has no per-core split.
+            if let Some(clpc_cpu_w) = clpc_cpu_w {
+                soc.cpu_w = clpc_cpu_w;
+                soc.cpu_breakdown_unavailable = true;
+                for cluster in soc
+                    .ecpu_clusters
+                    .iter_mut()
+                    .chain(std::iter::once(&mut soc.pcpu_cluster))
+                {
+                    cluster.total_w = 0.0;
+                    for core in &mut cluster.cores {
+                        core.watts = 0.0;
+                    }
+                }
+            }
             cf_utils::cf_release(delta as _);
             soc.compute_total();
             Ok(soc)

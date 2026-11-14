@@ -294,6 +294,13 @@ system_profiler SPHardwareDataType | head -10   # chip model
 
 This helps add support for new Apple Silicon variants.
 
+On macOS 27, some machines stop updating the IOReport CPU energy counters
+([#20](https://github.com/k06a/macpow/issues/20)). On systems with the
+`AppleT6050CLPC` driver, macpow can read aggregate CPU power from AppleCLPC
+without `sudo`. This counter has no breakdown by cluster or core. The TUI shows
+`N/A` for those power readings. In JSON, `soc.cpu_breakdown_unavailable` is
+`true` and the corresponding wattage fields remain numeric zeros for compatibility.
+
 ## License
 
 [MIT](LICENSE)
