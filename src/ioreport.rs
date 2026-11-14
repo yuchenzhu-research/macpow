@@ -19,7 +19,7 @@ use core_foundation_sys::string::CFStringRef;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::{PhantomData, PhantomPinned};
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── opaque handle ────────────────────────────────────────────────────────────
 
@@ -651,6 +651,42 @@ impl IOReportSampler {
         }
     }
 
+    /// Check the named Energy Model counters directly, independently of the
+    /// source selected for the aggregate CPU power row.
+    pub fn check_cpu_core_counters(&self) -> Result<()> {
+        let prev = self.sample()?;
+        std::thread::sleep(Duration::from_secs(2));
+        let cur = self.sample()?;
+        let dt = cur.ts.duration_since(prev.ts);
+        let before = prev.cpu_core_energy();
+        let after = cur.cpu_core_energy();
+        if before.is_empty() {
+            bail!("No per-core CPU Energy Model channels found");
+        }
+
+        println!(
+            "Per-core Energy Model counters over {:.3} s:",
+            dt.as_secs_f64()
+        );
+        let mut advancing = 0;
+        for (name, (unit, start)) in &before {
+            match after.get(name) {
+                Some((end_unit, end)) if unit == end_unit && end > start => {
+                    let delta = end - start;
+                    let watts = energy_to_watts(delta, unit, dt.as_millis() as u64);
+                    println!("{name:<16} {watts:>8.3} W    +{delta} {unit}");
+                    advancing += 1;
+                }
+                Some((end_unit, end)) if unit == end_unit && end == start => {
+                    println!("{name:<16}      N/A      counter unchanged");
+                }
+                _ => println!("{name:<16}      N/A      counter reset or missing"),
+            }
+        }
+        println!("{advancing}/{} core counters advanced.", before.len());
+        Ok(())
+    }
+
     /// Dump all subscribed channel names for diagnostics.
     pub fn dump_channels(&self) {
         if let Ok(sample) = self.sample() {
@@ -1104,6 +1140,30 @@ impl Drop for IOReportSampler {
 pub struct Sample {
     inner: CFDictionaryRef,
     ts: Instant,
+}
+
+impl Sample {
+    fn cpu_core_energy(&self) -> BTreeMap<String, (String, i64)> {
+        unsafe {
+            let channels = cf_utils::cfdict_get(self.inner, "IOReportChannels") as CFArrayRef;
+            (0..cf_utils::cfarray_len(channels))
+                .filter_map(|i| {
+                    let channel = cf_utils::cfarray_get(channels, i) as CFDictionaryRef;
+                    let group = cf_utils::cfstring_to_string(IOReportChannelGetGroup(channel))?;
+                    if group != "Energy Model" {
+                        return None;
+                    }
+                    let name =
+                        cf_utils::cfstring_to_string(IOReportChannelGetChannelName(channel))?;
+                    parse_energy_core_key(strip_die_prefix(&name).1)?;
+                    let unit = cf_utils::cfstring_to_string(IOReportChannelGetUnitLabel(channel))?;
+                    let reading = IOReportSimpleGetIntegerValue(channel, 0);
+                    (matches!(unit.as_str(), "mJ" | "uJ" | "nJ") && reading >= 0)
+                        .then_some((name, (unit, reading)))
+                })
+                .collect()
+        }
+    }
 }
 
 unsafe impl Send for Sample {}
